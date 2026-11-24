@@ -135,19 +135,77 @@ public class GLRenderer implements GLSurfaceView.Renderer {
 
     private volatile String pendingBakeSwitch = null;  // 烘焙完成后要切到的缓存文件名
 
+    // 烘焙进度回调（UI 线程执行）
+    public interface BakeListener {
+        void onProgress(int percent, String stage, long elapsedMs, long remainMs);
+        void onDone(boolean ok, String msg);
+    }
+    private volatile BakeListener bakeListener = null;
+    private final android.os.Handler bakeHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+    public void setBakeListener(BakeListener l) { this.bakeListener = l; }
+
     // 主线程调用：后台线程把 GLB 烘焙成 NVR2 缓存，成功后自动重扫并切到缓存版。
+    // 进度分四段加权：读文件 0-5%、解析 5-60%、序列化 60-95%、写盘 95-100%。
     public void bakeAndSwitch(final ModelScanner.Entry entry) {
         if (entry == null) return;
         final android.content.Context ctx = currentContext;
         new Thread(new Runnable() {
             @Override
             public void run() {
+                final long t0 = System.currentTimeMillis();
+                // percent/stage 由后台算好，统一 post 回主线程回调 UI
+                final int[] lastPct = {0};
+                final class Rpt {
+                    void p(final int pct, final String stage) {
+                        if (pct <= lastPct[0]) return;   // 进度只增不减
+                        lastPct[0] = pct;
+                        final long elapsed = System.currentTimeMillis() - t0;
+                        // 用已完成比例线性外推总时长，剩余 = 总 - 已用；前期样本少时偏保守
+                        final long remain = pct >= 3 ? (long) (elapsed * (100.0 - pct) / pct) : -1;
+                        bakeHandler.post(new Runnable() {
+                            @Override public void run() {
+                                BakeListener l = bakeListener;
+                                if (l != null) l.onProgress(pct, stage, elapsed, remain);
+                            }
+                        });
+                    }
+                    void done(final boolean ok, final String msg) {
+                        bakeHandler.post(new Runnable() {
+                            @Override public void run() {
+                                BakeListener l = bakeListener;
+                                if (l != null) l.onDone(ok, msg);
+                            }
+                        });
+                    }
+                }
+                final Rpt rpt = new Rpt();
                 try {
                     Diag.log("开始烘焙缓存: " + entry.label);
+                    rpt.p(2, "读取文件");
                     byte[] bytes = ModelScanner.readEntry(ctx, entry);
-                    MeshParts mp = MeshParts.fromBytes(bytes, entry.label);
+
+                    // 解析 GLB：5% -> 60%
+                    Progress parseP = new Progress() {
+                        @Override public void onProgress(int done, int total, String stage) {
+                            int pct = 5 + (int) (55L * done / Math.max(1, total));
+                            rpt.p(pct, "解析模型 " + done + "/" + total);
+                        }
+                    };
+                    MeshParts mp = (ModelScanner.isGlbEntry(entry))
+                            ? MeshParts.fromBytes(bytes, entry.label, parseP)
+                            : MeshParts.fromBytes(bytes, entry.label);
                     if (mp == null || mp.parts.isEmpty()) throw new Exception("解析出的网格为空");
-                    byte[] nvr2 = MeshParts.toNvr2Bytes(mp);
+
+                    // 序列化：60% -> 95%
+                    Progress saveP = new Progress() {
+                        @Override public void onProgress(int done, int total, String stage) {
+                            int pct = 60 + (int) (35L * done / Math.max(1, total));
+                            rpt.p(pct, "写入缓存 " + done + "/" + total);
+                        }
+                    };
+                    byte[] nvr2 = MeshParts.toNvr2Bytes(mp, saveP);
+
+                    rpt.p(96, "保存文件");
                     String cacheName = ModelScanner.cacheNameFor(new File(entry.file).getName());
                     File dest = new File(ModelScanner.externalDir(ctx), cacheName);
                     java.io.FileOutputStream fos = new java.io.FileOutputStream(dest);
@@ -155,8 +213,11 @@ public class GLRenderer implements GLSurfaceView.Renderer {
                     Diag.log("烘焙完成 " + cacheName + " " + nvr2.length + "B -> " + dest.getAbsolutePath());
                     pendingBakeSwitch = cacheName;
                     pendingRescan = true;
+                    rpt.p(100, "完成");
+                    rpt.done(true, cacheName);
                 } catch (Throwable t) {
                     Diag.log("!! 烘焙失败: " + Diag.stack(t));
+                    rpt.done(false, t.getMessage() == null ? "未知错误" : t.getMessage());
                 }
             }
         }, "nvr-bake").start();

@@ -18,6 +18,8 @@ import android.util.Log;
 import android.view.View;
 import android.widget.Button;
 import android.widget.FrameLayout;
+import android.widget.LinearLayout;
+import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -179,11 +181,68 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
                         + "ms，" + tris + " 三角面），可能会卡顿。\n\n"
                         + "是否转换为内置格式缓存？转换过程稍慢，但之后每次打开都会很快，且不影响原文件。")
                 .setPositiveButton("转换并加速", (dialog, which) -> {
-                    Toast.makeText(this, "开始转换，请稍候…", Toast.LENGTH_SHORT).show();
+                    showBakeProgress();
                     renderer.bakeAndSwitch(entry);
                 })
                 .setNegativeButton("保持实时解析", null)
                 .show();
+    }
+
+    // 烘焙进度对话框：进度条 + 百分比 + 阶段 + 已用/预计剩余时间，不可取消
+    private void showBakeProgress() {
+        int pad = (int) (18 * getResources().getDisplayMetrics().density);
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(pad, pad, pad, pad);
+
+        final TextView info = new TextView(this);
+        info.setTextSize(14);
+        info.setText("准备转换…");
+        final TextView times = new TextView(this);
+        times.setTextSize(12);
+        times.setText("已用 0s · 预计剩余 --");
+        final ProgressBar bar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        bar.setMax(100);
+        LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        bp.topMargin = pad / 2;
+        bar.setLayoutParams(bp);
+
+        box.addView(info);
+        box.addView(times);
+        box.addView(bar);
+
+        final AlertDialog dlg = new AlertDialog.Builder(this)
+                .setTitle("转换模型为缓存")
+                .setView(box)
+                .setCancelable(false)
+                .show();
+
+        renderer.setBakeListener(new GLRenderer.BakeListener() {
+            @Override
+            public void onProgress(int percent, String stage, long elapsedMs, long remainMs) {
+                bar.setProgress(percent);
+                info.setText(stage + "  " + percent + "%");
+                String rem = remainMs < 0 ? "--" : (remainMs >= 1000
+                        ? (remainMs / 1000) + "s" : "不到1s");
+                times.setText("已用 " + (elapsedMs / 1000) + "s · 预计剩余 " + rem);
+            }
+
+            @Override
+            public void onDone(boolean ok, String msg) {
+                try { dlg.dismiss(); } catch (Throwable ignore) { }
+                renderer.setBakeListener(null);
+                if (ok) {
+                    Toast.makeText(MainActivity.this, "转换完成，已切换到缓存版", Toast.LENGTH_LONG).show();
+                } else {
+                    new AlertDialog.Builder(MainActivity.this)
+                            .setTitle("转换失败")
+                            .setMessage("原始模型未受影响，可继续使用实时解析。\n原因：" + msg)
+                            .setPositiveButton("知道了", null)
+                            .show();
+                }
+            }
+        });
     }
 
     // 弹出模型选择框，内容由 GLRenderer 自动扫描得到，没有硬编码

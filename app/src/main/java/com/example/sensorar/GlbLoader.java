@@ -32,6 +32,11 @@ class GlbLoader {
     static final int MAGIC = 0x46546C67; // ASCII "glTF"
 
     static MeshParts load(byte[] all, String tag) {
+        return load(all, tag, null);
+    }
+
+    // 带进度回调的加载：烘焙时传入，实时上报解析到哪个 primitive
+    static MeshParts load(byte[] all, String tag, Progress progress) {
         MeshParts m = new MeshParts();
         try {
             ByteBuffer bb = ByteBuffer.wrap(all).order(ByteOrder.LITTLE_ENDIAN);
@@ -62,7 +67,7 @@ class GlbLoader {
 
             String json = new String(jsonBytes, "UTF-8").trim();
             JSONObject root = new JSONObject(json);
-            parse(root, binBytes, m, tag);
+            parse(root, binBytes, m, tag, progress);
         } catch (Throwable t) {
             String msg = t.getMessage();
             Diag.log("!! GLB 解析失败 " + tag + ": " + (msg == null ? Diag.stack(t) : msg));
@@ -72,7 +77,7 @@ class GlbLoader {
 
     // ---------- 场景 / 节点 ----------
 
-    private static void parse(JSONObject root, byte[] bin, MeshParts out, String tag) throws Exception {
+    private static void parse(JSONObject root, byte[] bin, MeshParts out, String tag, Progress progress) throws Exception {
         JSONArray accessors = root.optJSONArray("accessors");
         JSONArray bufferViews = root.optJSONArray("bufferViews");
         JSONArray meshes = root.optJSONArray("meshes");
@@ -99,8 +104,29 @@ class GlbLoader {
         boolean[] visiting = new boolean[nodeCount];
         for (int r : roots) visitNode(r, IDENTITY, nodes, world, visiting, 0);
 
+        // 先统计可解析的 primitive 总数，作为进度分母
+        int workTotal = 0;
+        for (int i = 0; i < nodeCount; i++) {
+            JSONObject nd = nodes.optJSONObject(i);
+            if (nd == null || nd.optInt("mesh", -1) < 0) continue;
+            JSONObject me = meshes.optJSONObject(nd.optInt("mesh", -1));
+            if (me == null) continue;
+            JSONArray ps = me.optJSONArray("primitives");
+            if (ps == null) continue;
+            for (int k = 0; k < ps.length(); k++) {
+                JSONObject pr = ps.optJSONObject(k);
+                if (pr == null) continue;
+                JSONObject e = pr.optJSONObject("extensions");
+                if (e != null && (e.has("KHR_draco_mesh_compression") || e.has("EXT_meshopt_compression"))) continue;
+                JSONObject a = pr.optJSONObject("attributes");
+                if (a == null || !a.has("POSITION") || !pr.has("indices")) continue;
+                workTotal++;
+            }
+        }
+        if (workTotal == 0) workTotal = 1;
+
         int partTotal = 0;
-        int primTotal = 0, dracoSkip = 0;
+        int primTotal = 0, dracoSkip = 0, workDone = 0;
         for (int i = 0; i < nodeCount; i++) {
             JSONObject node = nodes.optJSONObject(i);
             if (node == null) continue;
@@ -155,6 +181,8 @@ class GlbLoader {
                 int before = out.parts.size();
                 addParts(out, pos, nrm, uv, vcount, tri, proto);
                 partTotal += out.parts.size() - before;
+                workDone++;
+                if (progress != null) progress.onProgress(workDone, workTotal, "解析模型");
             }
         }
         Diag.log("GLB 解析 " + tag + " primitives=" + primTotal

@@ -44,10 +44,15 @@ class MeshParts {
     // 从字节数组加载：自动发现机制统一走这里（assets / 外部文件都能处理）
     // 按文件头魔数分派：GLB(含 VRM) 走运行时 glTF 解析器，其余按私有 NVR2 网格解析。
     static MeshParts fromBytes(byte[] all, String tag) {
+        return fromBytes(all, tag, null);
+    }
+
+    // 带进度回调版本：仅 GLB 路径上报解析进度，NVR2 加载本身很快无需上报
+    static MeshParts fromBytes(byte[] all, String tag, Progress progress) {
         if (all != null && all.length >= 4) {
             int magic = (all[0] & 0xFF) | ((all[1] & 0xFF) << 8)
                     | ((all[2] & 0xFF) << 16) | ((all[3] & 0xFF) << 24);
-            if (magic == ModelScanner.GLB_MAGIC) return GlbLoader.load(all, tag);
+            if (magic == ModelScanner.GLB_MAGIC) return GlbLoader.load(all, tag, progress);
         }
         return parse(all, tag);
     }
@@ -55,6 +60,10 @@ class MeshParts {
     // 把解析好的网格烘焙成 NVR2 字节（运行时 GLB 解析慢时，缓存成私有格式下次秒开）。
     // 布局与 parse() 严格对称：magic/version/parts + 每部件头 + 顶点 + u16 索引 + 贴图。
     static byte[] toNvr2Bytes(MeshParts m) throws Exception {
+        return toNvr2Bytes(m, null);
+    }
+
+    static byte[] toNvr2Bytes(MeshParts m, Progress progress) throws Exception {
         if (m == null || m.parts.isEmpty()) throw new Exception("空网格无法烘焙");
         ByteArrayOutputStream bo = new ByteArrayOutputStream();
         ByteBuffer head = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN);
@@ -63,7 +72,8 @@ class MeshParts {
         head.putInt(m.parts.size());
         bo.write(head.array());
 
-        for (Part p : m.parts) {
+        for (int i = 0; i < m.parts.size(); i++) {
+            Part p = m.parts.get(i);
             byte[] tex = encodeTexture(p.bitmap);
             ByteBuffer ph = ByteBuffer.allocate(24).order(ByteOrder.LITTLE_ENDIAN);
             ph.putInt(p.vertexCount);
@@ -87,6 +97,7 @@ class MeshParts {
             bo.write(ibytes);
 
             bo.write(tex);
+            if (progress != null) progress.onProgress(i + 1, m.parts.size(), "写入缓存");
         }
         return bo.toByteArray();
     }

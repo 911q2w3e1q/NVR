@@ -49,6 +49,10 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
     private String bakeOfferedFor = null;     // 已就哪个模型弹过烘焙建议（按文件路径区分）
 
     private AREngine ar;
+    // EasyAR native 库只有 initialize 成功后才加载。未配 Key / 初始化失败时
+    // 绝不能调用任何 EasyAR native 方法（onResume/onPause/versionString 等），
+    // 否则 JNI 抛 UnsatisfiedLinkError 直接崩溃。
+    private boolean engineReady = false;
     private final Handler hudHandler = new Handler(Looper.getMainLooper());
 
     // 启动状态：全部收敛到 onResume，避免 onCreate 和 onResume 重复拉起
@@ -122,12 +126,18 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
         long t0 = System.currentTimeMillis();
         boolean ok = false;
         if (EasyKey.CONFIGURED) {
-            ok = Engine.initialize(this, EasyKey.KEY);
+            try {
+                ok = Engine.initialize(this, EasyKey.KEY);
+            } catch (Throwable t) {
+                Diag.log("!! Engine.initialize 异常: " + Diag.stack(t));
+            }
         }
         long cost = System.currentTimeMillis() - t0;
+        engineReady = EasyKey.CONFIGURED && ok;   // native 库已加载，后续生命周期调用才安全
         Diag.log("Engine.initialize=" + ok + " 耗时=" + cost + "ms version=" + safeVersion());
         if (EasyKey.CONFIGURED && !ok) {
-            String err = Engine.errorMessage();
+            String err = null;
+            try { err = Engine.errorMessage(); } catch (Throwable ignore) { }
             Diag.log("!! 初始化失败: " + err);
             new AlertDialog.Builder(this)
                     .setTitle("EasyAR 初始化失败")
@@ -259,6 +269,7 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
     }
 
     private String safeVersion() {
+        if (!engineReady) return "未初始化";
         try { return Engine.versionString(); }
         catch (Throwable t) {
             Diag.log("!! versionString 异常: " + t.getMessage());
@@ -295,7 +306,7 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
         super.onResume();
         Diag.log("onResume");
         resumed = true;
-        Engine.onResume();
+        if (engineReady) Engine.onResume();
         if (glView != null) glView.onResume();
         if (lightSensor != null)
             sensorManager.registerListener(this, lightSensor, SensorManager.SENSOR_DELAY_UI);
@@ -310,7 +321,7 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
         super.onPause();
         sensorManager.unregisterListener(this);
         hudHandler.removeCallbacksAndMessages(null);
-        Engine.onPause();
+        if (engineReady) Engine.onPause();
         if (glView != null) glView.onPause();
         // 切后台停相机省电；onResume 会用缓存的标定重建
         if (ar != null) ar.stop();

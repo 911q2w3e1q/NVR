@@ -1,0 +1,62 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.example.sensorar'
+    compileSdk 34
+
+    // 签名：优先用本地 keystore，没有就退回 debug 签名，保证别人 clone 后能直接编译安装
+    signingConfigs {
+        release {
+            def ks = file('nvr.keystore')
+            if (ks.exists()) {
+                storeFile ks
+                storePassword 'android'
+                keyAlias 'androiddebugkey'
+                keyPassword 'android'
+            } else {
+                storeFile file(System.getProperty("user.home") + "/.android/debug.keystore")
+                storePassword 'android'
+                keyAlias 'androiddebugkey'
+                keyPassword 'android'
+            }
+        }
+    }
+
+    defaultConfig {
+        applicationId 'com.nvr.app'
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName '1.0'
+
+        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
+    }
+
+    buildTypes {
+        release {
+            // 启用代码混淆与资源压缩
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            signingConfig signingConfigs.release
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    // 模型文件保持原样：不压缩 assets 里的 .mesh，读进来和源文件逐字节一致。
+    // 注意这是 aapt 的资源处理，和 R8 的代码混淆是两回事——R8 本来就不会动 assets。
+    androidResources {
+        noCompress 'mesh'
+    }
+}
+
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation files('libs/EasyAR.aar')
+}

@@ -1,0 +1,27 @@
+# Gradle / Android 构建产物
+.gradle/
+build/
+app/build/
+captures/
+.externalNativeBuild/
+.cxx/
+local.properties
+
+# Android Studio
+*.iml
+.idea/
+.vscode/
+
+# 本地签名密钥（用 debug.keystore 兜底，不入库）
+*.keystore
+*.jks
+
+# 用户自己放进来的模型（版权归各自所有者，不入库）
+app/src/main/assets/*.mesh
+app/src/main/assets/*.vrm
+app/src/main/assets/models/
+app/src/main/assets/*.glb
+
+# OS
+.DS_Store
+Thumbs.db

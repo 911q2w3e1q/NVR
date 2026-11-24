@@ -11,12 +11,15 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 
-// 自动发现可用模型：扫 assets 和应用外部 models 目录，读文件头校验 NVR2 魔数。
-// 别人拿到源码后，把自己的 .mesh 丢进这两个位置任意一个就能用，不用改代码。
+// 自动发现可用模型：扫 assets 和应用外部 models 目录，读文件头校验魔数。
+// 支持两种格式：私有 .mesh/.nvr2(NVR2) 和标准 .glb/.vrm(glTF 2.0 容器)。
+// 别人拿到源码后，把自己的模型丢进这两个位置任意一个就能用，不用改代码。
 class ModelScanner {
 
     // NVR2 文件头魔数，小端读出来是 0x3252564E（ASCII "NVR2"）
     static final int MAGIC = 0x3252564E;
+    // GLB 文件头魔数，小端读出来是 0x46546C67（ASCII "glTF"），VRM 也是这个容器
+    static final int GLB_MAGIC = 0x46546C67;
 
     static final int SRC_ASSET = 0;   // 打包在 assets 里
     static final int SRC_FILE = 1;    // 外部 models 目录里的文件
@@ -56,8 +59,45 @@ class ModelScanner {
                 return a.label.compareToIgnoreCase(b.label);
             }
         });
+        // 同名去重：烘焙生成的 NVR2 缓存优先于它的 GLB/VRM 源文件，避免列表里出现两份
+        list = dedupCache(list);
         Diag.log("模型扫描: 发现 " + list.size() + " 个 -> " + labels(list));
         return list;
+    }
+
+    // 缓存文件名 = 源文件去掉扩展名 + ".nvr2"（如 skin.vrm -> skin.nvr2）。
+    // 若同 label 既有烘焙缓存(NVR2)又有源(GLB/VRM)，只保留 NVR2，让已转化的模型走快路径。
+    private static List<Entry> dedupCache(List<Entry> list) {
+        List<Entry> out = new ArrayList<>();
+        for (Entry e : list) {
+            boolean covered = false;
+            if (isGlbEntry(e)) {
+                for (Entry other : list) {
+                    if (other == e || !isNvr2Entry(other)) continue;
+                    if (other.label.equalsIgnoreCase(e.label)
+                            && other.source == e.source) { covered = true; break; }
+                }
+            }
+            if (!covered) out.add(e);
+        }
+        return out;
+    }
+
+    static boolean isGlbEntry(Entry e) {
+        String s = e.file.toLowerCase();
+        return s.endsWith(".glb") || s.endsWith(".vrm");
+    }
+
+    static boolean isNvr2Entry(Entry e) {
+        String s = e.file.toLowerCase();
+        return s.endsWith(".mesh") || s.endsWith(".nvr2");
+    }
+
+    // 烘焙缓存路径：和源文件同目录、同 basename，扩展名换成 .nvr2
+    static String cacheNameFor(String sourceName) {
+        int dot = sourceName.lastIndexOf('.');
+        String base = dot > 0 ? sourceName.substring(0, dot) : sourceName;
+        return base + ".nvr2";
     }
 
     private static String labels(List<Entry> list) {
@@ -85,11 +125,11 @@ class ModelScanner {
             String[] names = am.list(dir);
             if (names == null) return;
             for (String name : names) {
-                if (!name.toLowerCase().endsWith(".mesh")) continue;
+                if (!isModelName(name)) continue;
                 String rel = dir.isEmpty() ? name : dir + "/" + name;
                 long size;
                 try { size = assetSize(am, rel); } catch (Throwable t) { continue; }
-                if (!isNvr2Asset(am, rel)) {
+                if (!isModelAsset(am, rel)) {
                     Diag.log("跳过非模型文件(魔数不符): " + rel);
                     continue;
                 }
@@ -105,8 +145,8 @@ class ModelScanner {
         File[] files = dir.listFiles();
         if (files == null) return;
         for (File f : files) {
-            if (!f.isFile() || !f.getName().toLowerCase().endsWith(".mesh")) continue;
-            if (!isNvr2File(f)) {
+            if (!f.isFile() || !isModelName(f.getName())) continue;
+            if (!isModelFile(f)) {
                 Diag.log("跳过非模型文件(魔数不符): " + f.getName());
                 continue;
             }
@@ -115,7 +155,14 @@ class ModelScanner {
         }
     }
 
-    // 文件名 -> 显示名：去掉 .mesh 和 _nvr2 后缀，下划线转空格
+    // 只认这四种模型后缀（大小写不敏感）
+    static boolean isModelName(String name) {
+        String s = name.toLowerCase();
+        return s.endsWith(".mesh") || s.endsWith(".nvr2")
+                || s.endsWith(".glb") || s.endsWith(".vrm");
+    }
+
+    // 文件名 -> 显示名：去掉扩展名和 _nvr2 后缀，下划线转空格
     static String labelOf(String fileName) {
         String s = fileName;
         int dot = s.lastIndexOf('.');
@@ -131,11 +178,11 @@ class ModelScanner {
     }
 
     // 只打开文件读前 4 字节校验魔数，不把整个模型读进内存
-    static boolean isNvr2File(File f) {
+    static boolean isModelFile(File f) {
         InputStream in = null;
         try {
             in = new FileInputStream(f);
-            return checkMagic(in);
+            return checkModelMagic(in);
         } catch (Throwable t) {
             return false;
         } finally {
@@ -143,11 +190,11 @@ class ModelScanner {
         }
     }
 
-    static boolean isNvr2Asset(AssetManager am, String rel) {
+    static boolean isModelAsset(AssetManager am, String rel) {
         InputStream in = null;
         try {
             in = am.open(rel);
-            return checkMagic(in);
+            return checkModelMagic(in);
         } catch (Throwable t) {
             return false;
         } finally {
@@ -155,7 +202,8 @@ class ModelScanner {
         }
     }
 
-    private static boolean checkMagic(InputStream in) throws Exception {
+    // NVR2 和 GLB(含 VRM) 两种魔数都算合法模型
+    private static boolean checkModelMagic(InputStream in) throws Exception {
         byte[] head = new byte[4];
         int got = 0;
         while (got < 4) {
@@ -166,7 +214,7 @@ class ModelScanner {
         if (got < 4) return false;
         int magic = (head[0] & 0xFF) | ((head[1] & 0xFF) << 8)
                 | ((head[2] & 0xFF) << 16) | ((head[3] & 0xFF) << 24);
-        return magic == MAGIC;
+        return magic == MAGIC || magic == GLB_MAGIC;
     }
 
     private static long assetSize(AssetManager am, String rel) throws Exception {

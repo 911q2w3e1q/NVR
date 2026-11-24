@@ -7,6 +7,7 @@ import android.opengl.GLSurfaceView;
 import android.opengl.Matrix;
 import android.opengl.GLUtils;
 
+import java.io.File;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Random;
@@ -106,12 +107,60 @@ public class GLRenderer implements GLSurfaceView.Renderer {
     private volatile boolean pendingRescan = false;           // 外部目录增删了文件，需要重扫
     private String curModel = "无";
 
+    // 硬加载(GLB/VRM 运行时解析)的性能观测：解析耗时 + 三角面数。
+    // 超过阈值时给 MainActivity 打一个"建议烘焙"标记，让用户决定是否转私有格式缓存。
+    private volatile boolean bakeSuggested = false;
+    private volatile ModelScanner.Entry bakeEntry = null;
+    private volatile long lastLoadCostMs = 0;
+    private volatile int lastTriangles = 0;
+    private static final long BAKE_COST_THRESHOLD_MS = 900;   // 解析超过 900ms 视为卡
+    private static final int BAKE_TRI_THRESHOLD = 120000;     // 或三角面超过 12 万
+
     public void requestSwitchModel(ModelScanner.Entry e) { this.pendingModel = e; }
     public void requestRescan() { this.pendingRescan = true; }
     public java.util.List<ModelScanner.Entry> availableModels() {
         return new java.util.ArrayList<>(models);
     }
     public String currentModel() { return curModel; }
+
+    // 主线程轮询：是否有模型建议烘焙成缓存。消费后自动清除，避免重复弹窗。
+    public boolean consumeBakeSuggestion() {
+        if (!bakeSuggested) return false;
+        bakeSuggested = false;
+        return true;
+    }
+    public ModelScanner.Entry getBakeEntry() { return bakeEntry; }
+    public long getLastLoadCostMs() { return lastLoadCostMs; }
+    public int getLastTriangles() { return lastTriangles; }
+
+    private volatile String pendingBakeSwitch = null;  // 烘焙完成后要切到的缓存文件名
+
+    // 主线程调用：后台线程把 GLB 烘焙成 NVR2 缓存，成功后自动重扫并切到缓存版。
+    public void bakeAndSwitch(final ModelScanner.Entry entry) {
+        if (entry == null) return;
+        final android.content.Context ctx = currentContext;
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Diag.log("开始烘焙缓存: " + entry.label);
+                    byte[] bytes = ModelScanner.readEntry(ctx, entry);
+                    MeshParts mp = MeshParts.fromBytes(bytes, entry.label);
+                    if (mp == null || mp.parts.isEmpty()) throw new Exception("解析出的网格为空");
+                    byte[] nvr2 = MeshParts.toNvr2Bytes(mp);
+                    String cacheName = ModelScanner.cacheNameFor(new File(entry.file).getName());
+                    File dest = new File(ModelScanner.externalDir(ctx), cacheName);
+                    java.io.FileOutputStream fos = new java.io.FileOutputStream(dest);
+                    try { fos.write(nvr2); fos.flush(); } finally { fos.close(); }
+                    Diag.log("烘焙完成 " + cacheName + " " + nvr2.length + "B -> " + dest.getAbsolutePath());
+                    pendingBakeSwitch = cacheName;
+                    pendingRescan = true;
+                } catch (Throwable t) {
+                    Diag.log("!! 烘焙失败: " + Diag.stack(t));
+                }
+            }
+        }, "nvr-bake").start();
+    }
 
     // 锚定 / 地面
     private final float[] pos = new float[3];
@@ -189,7 +238,7 @@ public class GLRenderer implements GLSurfaceView.Renderer {
         if (!models.isEmpty()) {
             loadModel(models.get(0));
         } else {
-            Diag.log("!! 没找到任何合法模型(.mesh)，请把模型放进 assets 或外部 models 目录");
+            Diag.log("!! 没找到任何合法模型(.mesh/.glb/.vrm)，请把模型放进 assets 或外部 models 目录");
         }
         GLES20.glGenTextures(1, camTex, 0);
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, camTex[0]);
@@ -218,9 +267,23 @@ public class GLRenderer implements GLSurfaceView.Renderer {
             Diag.log("!! 读取模型失败 " + entry.label + ": " + t.getMessage());
             return;
         }
+        long t0 = System.currentTimeMillis();
         mesh = MeshParts.fromBytes(bytes, entry.label);
+        lastLoadCostMs = System.currentTimeMillis() - t0;
         if (mesh != null && !mesh.parts.isEmpty()) {
             partCount = mesh.parts.size();
+            // 统计三角面数，配合解析耗时判断是否需要烘焙成私有缓存
+            int tris = 0;
+            for (MeshParts.Part pp : mesh.parts) tris += pp.indexCount / 3;
+            lastTriangles = tris;
+            boolean glb = ModelScanner.isGlbEntry(entry);
+            boolean cached = new File(entry.file).getName().toLowerCase().endsWith(".nvr2");
+            if (glb && !cached
+                    && (lastLoadCostMs >= BAKE_COST_THRESHOLD_MS || tris >= BAKE_TRI_THRESHOLD)) {
+                bakeSuggested = true;
+                bakeEntry = entry;
+                Diag.log("模型较重(解析" + lastLoadCostMs + "ms, 三角" + tris + ")，可考虑烘焙缓存");
+            }
             partVbo = new int[partCount];
             partIbo = new int[partCount];
             partTex = new int[partCount];
@@ -271,6 +334,18 @@ public class GLRenderer implements GLSurfaceView.Renderer {
             pendingRescan = false;
             models = ModelScanner.scan(currentContext);
             Diag.log("已重新扫描模型，当前 " + models.size() + " 个");
+        }
+        // 烘焙完成后自动切到新生成的缓存版
+        if (pendingBakeSwitch != null) {
+            String name = pendingBakeSwitch;
+            pendingBakeSwitch = null;
+            for (ModelScanner.Entry e : models) {
+                if (new File(e.file).getName().equals(name)) {
+                    Diag.log("自动切换到烘焙缓存: " + e.label);
+                    loadModel(e);
+                    break;
+                }
+            }
         }
         ModelScanner.Entry req = pendingModel;
         if (req != null) {

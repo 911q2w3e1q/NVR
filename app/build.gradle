@@ -49,10 +49,11 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
 
-    // 模型文件保持原样：不压缩 assets 里的 .mesh，读进来和源文件逐字节一致。
+    // 模型文件保持原样：不压缩 assets 里的模型，读进来和源文件逐字节一致。
+    // .glb/.vrm 首 4 字节是魔数，一旦被 aapt 重压缩魔数校验就会失败，必须一并排除。
     // 注意这是 aapt 的资源处理，和 R8 的代码混淆是两回事——R8 本来就不会动 assets。
     androidResources {
-        noCompress 'mesh'
+        noCompress 'mesh', 'nvr2', 'glb', 'vrm'
     }
 }
 

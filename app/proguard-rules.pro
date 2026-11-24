@@ -1,7 +1,7 @@
 # 代码混淆规则（R8 / ProGuard）
 #
-# 重要：assets 目录下的 .mesh 模型文件不是 Java 类，R8 从不混淆资源文件，
-# 模型一律保持原样。同时 build.gradle 里对 .mesh 做了 noCompress，
+# 重要：assets 目录下的 .mesh / .glb / .vrm 模型文件不是 Java 类，R8 从不混淆资源文件，
+# 模型一律保持原样。同时 build.gradle 里对 .mesh/.glb/.vrm 做了 noCompress，
 # 保证模型字节不被 aapt 重新压缩，读进来和源文件逐字节一致。
 
 # EasyAR 通过 JNI 反射调用，整个包必须原样保留（AAR 自带的 consumer 规则
@@ -16,6 +16,8 @@
 -keep class com.example.sensorar.ModelScanner$Entry { *; }
 -keep class com.example.sensorar.MeshParts { *; }
 -keep class com.example.sensorar.MeshParts$Part { *; }
+-keep class com.example.sensorar.GlbLoader { *; }
+-keep class com.example.sensorar.GlbLoader$* { *; }
 -keep class com.example.sensorar.GLRenderer { *; }
 -keep class com.example.sensorar.MainActivity { *; }
 

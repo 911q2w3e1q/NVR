@@ -46,6 +46,7 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
     private SensorManager sensorManager;
     private Sensor lightSensor;
     private volatile float lastLux = -1f;
+    private String bakeOfferedFor = null;     // 已就哪个模型弹过烘焙建议（按文件路径区分）
 
     private AREngine ar;
     private final Handler hudHandler = new Handler(Looper.getMainLooper());
@@ -73,7 +74,7 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
             Diag.log("重新锚定");
         });
 
-        // 右下角：导入模型。用系统文件选择器挑 .mesh，复制进外部 models 目录后自动生效
+        // 右下角：导入模型。系统文件选择器挑 .mesh/.glb/.vrm，复制进外部 models 目录后自动生效
         Button btnImport = findViewById(R.id.btn_import);
         btnImport.setOnClickListener(v -> {
             Intent it = new Intent(Intent.ACTION_OPEN_DOCUMENT);
@@ -156,11 +157,30 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
         Diag.log("onCreate 结束");
     }
 
+    // 模型硬加载较慢时征询用户：是否烘焙成私有 NVR2 缓存
+    private void offerBake() {
+        final ModelScanner.Entry entry = renderer.getBakeEntry();
+        if (entry == null) return;
+        long ms = renderer.getLastLoadCostMs();
+        int tris = renderer.getLastTriangles();
+        new AlertDialog.Builder(this)
+                .setTitle("模型加载较慢")
+                .setMessage("当前模型「" + entry.label + "」采用实时解析（耗时约 " + ms
+                        + "ms，" + tris + " 三角面），可能会卡顿。\n\n"
+                        + "是否转换为内置格式缓存？转换过程稍慢，但之后每次打开都会很快，且不影响原文件。")
+                .setPositiveButton("转换并加速", (dialog, which) -> {
+                    Toast.makeText(this, "开始转换，请稍候…", Toast.LENGTH_SHORT).show();
+                    renderer.bakeAndSwitch(entry);
+                })
+                .setNegativeButton("保持实时解析", null)
+                .show();
+    }
+
     // 弹出模型选择框，内容由 GLRenderer 自动扫描得到，没有硬编码
     private void showModelPicker() {
         final java.util.List<ModelScanner.Entry> list = renderer.availableModels();
         if (list.isEmpty()) {
-            Toast.makeText(this, "没找到模型，请先把 .mesh 放进 assets 或点导入", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, "没找到模型，请先把 .mesh/.glb/.vrm 放进 assets 或点导入", Toast.LENGTH_LONG).show();
             return;
         }
         String[] names = new String[list.size()];
@@ -189,10 +209,10 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
         Uri uri = data.getData();
         if (uri == null) return;
         String name = queryDisplayName(uri);
-        if (name == null || !name.toLowerCase().endsWith(".mesh")) {
-            // 拿不到名字时按 URI 末尾兜底，仍不是 .mesh 就给个默认名再靠魔数校验
+        if (name == null || !ModelScanner.isModelName(name)) {
+            // 拿不到合法名字时按 URI 末尾兜底，仍不行就给默认名再靠魔数校验
             String last = uri.getLastPathSegment();
-            name = (last != null && last.toLowerCase().endsWith(".mesh")) ? last : "imported.mesh";
+            name = (last != null && ModelScanner.isModelName(last)) ? last : "imported.glb";
         }
         File dest = new File(ModelScanner.externalDir(this), name);
         java.io.InputStream in = null;
@@ -205,10 +225,10 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
             while ((r = in.read(buf)) > 0) out.write(buf, 0, r);
             out.flush();
             Diag.log("导入模型 " + name + " -> " + dest.getAbsolutePath() + " (" + dest.length() + "B)");
-            // 校验魔数，不是合法模型就删掉
-            if (!ModelScanner.isNvr2File(dest)) {
+            // 校验魔数，不是合法模型就删掉（NVR2 / GLB 都接受）
+            if (!ModelScanner.isModelFile(dest)) {
                 boolean del = dest.delete();
-                Toast.makeText(this, "不是合法的 NVR2 模型文件" + (del ? "，已删除" : ""), Toast.LENGTH_LONG).show();
+                Toast.makeText(this, "不是合法的模型文件(.mesh/.glb/.vrm)" + (del ? "，已删除" : ""), Toast.LENGTH_LONG).show();
             } else {
                 renderer.requestRescan();
                 Toast.makeText(this, "导入成功：" + name + "，点切换模型选它", Toast.LENGTH_LONG).show();
@@ -328,6 +348,14 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
                 hud.setText("NVR · VIO\n" + lux + "lux · " + status
                         + "\n" + fps + " FPS · 点此重置锚点"
                         + "\n模型: " + model);
+                // 硬加载的模型较重时，每个模型问一次是否烘焙成私有缓存（慢但只做一次，之后秒开）
+                if (renderer != null && renderer.consumeBakeSuggestion()) {
+                    ModelScanner.Entry be = renderer.getBakeEntry();
+                    if (be != null && !be.file.equals(bakeOfferedFor)) {
+                        bakeOfferedFor = be.file;
+                        offerBake();
+                    }
+                }
                 hudHandler.postDelayed(this, 300);
             }
         }, 200);

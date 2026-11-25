@@ -217,7 +217,16 @@ public class GLRenderer implements GLSurfaceView.Renderer {
                     rpt.done(true, cacheName);
                 } catch (Throwable t) {
                     Diag.log("!! 烘焙失败: " + Diag.stack(t));
-                    rpt.done(false, t.getMessage() == null ? "未知错误" : t.getMessage());
+                    String why;
+                    if (t instanceof OutOfMemoryError) {
+                        why = "内存不足，请先关闭其它应用重试";
+                    } else {
+                        String m = t.getMessage();
+                        why = (m == null || m.isEmpty())
+                                ? t.getClass().getSimpleName()   // 别再只显示"未知错误"
+                                : m;
+                    }
+                    rpt.done(false, why);
                 }
             }
         }, "nvr-bake").start();
@@ -371,9 +380,11 @@ public class GLRenderer implements GLSurfaceView.Renderer {
                 GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, texFilter);
                 GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, texFilter);
                 Bitmap bm = p.bitmap;
-                if (bm != null) {
+                if (bm != null && !bm.isRecycled()) {
                     GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bm, 0);
-                    bm.recycle();
+                    // 不 recycle：同一张贴图被多个 part 共享（readMaterial 去重），
+                    // 且白底图是全局共享的。手动回收会让后续 part 拿到已回收 bitmap 变黑。
+                    // 去重后贴图总量很小（<=10 张 512²），交给 GC 即可。
                     p.bitmap = null;
                 }
             }

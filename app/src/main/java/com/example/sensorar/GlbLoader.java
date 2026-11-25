@@ -125,6 +125,10 @@ class GlbLoader {
         }
         if (workTotal == 0) workTotal = 1;
 
+        // 贴图按 image 索引去重缓存：一个 GLB 常有多个 primitive 共用同一张贴图，
+        // 逐个重复解码会瞬间吃掉上百 MB 内存导致 OOM（表现为黑模/烘焙失败）。
+        Map<Integer, Bitmap> texCache = new HashMap<>();
+
         int partTotal = 0;
         int primTotal = 0, dracoSkip = 0, workDone = 0;
         for (int i = 0; i < nodeCount; i++) {
@@ -174,7 +178,7 @@ class GlbLoader {
                 MeshProto proto = new MeshProto();
                 int miMat = prim.optInt("material", -1);
                 if (materials != null && miMat >= 0 && miMat < materials.length()) {
-                    readMaterial(materials.optJSONObject(miMat), textures, images, bufferViews, bin, proto);
+                    readMaterial(materials.optJSONObject(miMat), textures, images, bufferViews, bin, proto, texCache);
                 }
 
                 // 顶点数超过 u16 上限时按三角形分块，每块 <= 65535 顶点
@@ -187,6 +191,48 @@ class GlbLoader {
         }
         Diag.log("GLB 解析 " + tag + " primitives=" + primTotal
                 + " 跳过压缩=" + dracoSkip + " parts=" + partTotal);
+        // 和 Python 烘焙脚本保持一致：模型脚底贴地(y=0)，整体缩放到 1.75m 高。
+        // 否则标准 GLB 的原始坐标大小/位置五花八门，放置后会飞天或过小。
+        normalizeScale(out);
+    }
+
+    // 把所有 part 的顶点统一平移到脚底 y=0、中心 xz=0，并等比缩放到目标身高 1.75m。
+    // 法线是方向量，等比缩放+平移不改变方向，无需处理。
+    private static void normalizeScale(MeshParts out) {
+        if (out.parts.isEmpty()) return;
+        float minX = Float.POSITIVE_INFINITY, maxX = Float.NEGATIVE_INFINITY;
+        float minY = Float.POSITIVE_INFINITY, maxY = Float.NEGATIVE_INFINITY;
+        float minZ = Float.POSITIVE_INFINITY, maxZ = Float.NEGATIVE_INFINITY;
+        ByteOrder LE = ByteOrder.LITTLE_ENDIAN;
+        for (MeshParts.Part p : out.parts) {
+            ByteBuffer vb = p.vertexBuf.duplicate().order(LE);
+            vb.clear();
+            while (vb.remaining() >= 32) {
+                float x = vb.getFloat(), y = vb.getFloat(), z = vb.getFloat();
+                vb.position(vb.position() + 20); // 跳 nrm3+uv2
+                if (x < minX) minX = x; if (x > maxX) maxX = x;
+                if (y < minY) minY = y; if (y > maxY) maxY = y;
+                if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+            }
+        }
+        float height = maxY - minY;
+        if (height <= 1e-6f || Float.isInfinite(height)) return;
+        float s = 1.75f / height;
+        float cx = (minX + maxX) * 0.5f, cz = (minZ + maxZ) * 0.5f;
+        for (MeshParts.Part p : out.parts) {
+            ByteBuffer vb = p.vertexBuf.duplicate().order(LE);
+            vb.clear();
+            while (vb.remaining() >= 32) {
+                int pos = vb.position();
+                float x = vb.getFloat(), y = vb.getFloat(), z = vb.getFloat();
+                vb.putFloat(pos,     (x - cx) * s);
+                vb.putFloat(pos + 4, (y - minY) * s);
+                vb.putFloat(pos + 8, (z - cz) * s);
+                vb.position(pos + 32);
+            }
+        }
+        Diag.log("GLB 归一化: 原始高度=" + String.format("%.2f", height)
+                + " 缩放=" + String.format("%.4f", s) + " -> 1.75m 脚底贴地");
     }
 
     private static void visitNode(int idx, float[] parent, JSONArray nodes,
@@ -218,6 +264,21 @@ class GlbLoader {
         visiting[idx] = false;
     }
 
+    // 共享 1x1 白底：无贴图材质用。只创建一次，绝不能 recycle（多个 part 共用）。
+    private static volatile Bitmap sWhite = null;
+    private static Bitmap whitePixel() {
+        if (sWhite == null) {
+            synchronized (GlbLoader.class) {
+                if (sWhite == null) {
+                    Bitmap b = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888);
+                    b.setPixel(0, 0, 0xFFFFFFFF);
+                    sWhite = b;
+                }
+            }
+        }
+        return sWhite;
+    }
+
     // ---------- 材质 ----------
 
     private static class MeshProto {
@@ -227,7 +288,8 @@ class GlbLoader {
     }
 
     private static void readMaterial(JSONObject mat, JSONArray textures, JSONArray images,
-                                     JSONArray bufferViews, byte[] bin, MeshProto out) {
+                                     JSONArray bufferViews, byte[] bin, MeshProto out,
+                                     Map<Integer, Bitmap> texCache) {
         if (mat == null) return;
         String alpha = mat.optString("alphaMode", "OPAQUE");
         if ("BLEND".equalsIgnoreCase(alpha)) out.blendMode = 1;
@@ -257,6 +319,9 @@ class GlbLoader {
         if (images == null || imgIdx < 0 || imgIdx >= images.length()) return;
         JSONObject img = images.optJSONObject(imgIdx);
         if (img == null) return;
+        // 同一张 image 只解码一次，所有引用它的 part 共享同一个 Bitmap。
+        Bitmap cached = texCache.get(imgIdx);
+        if (cached != null) { out.bitmap = cached; return; }
         try {
             byte[] png = null;
             if (img.has("bufferView")) {
@@ -272,7 +337,19 @@ class GlbLoader {
                     }
                 }
             }
-            if (png != null) out.bitmap = BitmapFactory.decodeByteArray(png, 0, png.length);
+            if (png != null) {
+                // 降采样：AR 场景里模型贴到屏幕上通常只有几百像素，1024² 纯属浪费内存。
+                // 超过 512 的贴图按 2 的幂缩小到 <=512，单张内存从 4MB 降到 <=1MB。
+                BitmapFactory.Options bounds = new BitmapFactory.Options();
+                bounds.inJustDecodeBounds = true;
+                BitmapFactory.decodeByteArray(png, 0, png.length, bounds);
+                int sample = 1;
+                while (bounds.outWidth / sample > 512 || bounds.outHeight / sample > 512) sample <<= 1;
+                BitmapFactory.Options opt = new BitmapFactory.Options();
+                opt.inSampleSize = sample;
+                Bitmap bm = BitmapFactory.decodeByteArray(png, 0, png.length, opt);
+                if (bm != null) { out.bitmap = bm; texCache.put(imgIdx, bm); }
+            }
         } catch (Throwable t) {
             Diag.log("!! GLB 贴图解码失败: " + t.getMessage());
         }
@@ -465,21 +542,15 @@ class GlbLoader {
         p.indexCount = ci;
         p.blendMode = proto.blendMode;
         p.factor = proto.factor.clone();
-        // 一个 primitive 拆成多块时共用同一贴图对象；渲染链路上传后会 recycle，
-        // 故每块给独立副本，避免第二块用到已回收的 Bitmap 崩溃。
-        // 材质没有贴图(KTX2/纯色)时给 1x1 白底，保证烘焙与渲染都有合法纹理。
+        // 贴图对象共享：readMaterial 已按 image 去重解码，这里绝不再 copy。
+        // 逐 part copy 一张 1024² 图 ≈ 4MB，34 个 part 就是 136MB，必然 OOM。
+        // 共享后由 GLRenderer 上传纹理时对整张图去重回收（见 uploadParts 的 seen 集合）。
+        // 材质没有贴图(KTX2/纯色)时用一张共享 1x1 白底，保证渲染/烘焙都有合法纹理。
         Bitmap src = proto.bitmap;
-        if (src == null || src.isRecycled()) {
-            src = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888);
-            src.setPixel(0, 0, 0xFFFFFFFF);
-        }
-        try {
-            p.bitmap = src.copy(src.getConfig() != null ? src.getConfig() : Bitmap.Config.ARGB_8888, false);
-        } catch (Throwable t) {
-            p.bitmap = src;
-        }
-        p.texW = p.bitmap.getWidth();
-        p.texH = p.bitmap.getHeight();
+        if (src == null || src.isRecycled()) src = whitePixel();
+        p.bitmap = src;
+        p.texW = src.getWidth();
+        p.texH = src.getHeight();
 
         byte[] vb = new byte[cv * 8 * 4];
         ByteBuffer vbb = ByteBuffer.wrap(vb).order(ByteOrder.LITTLE_ENDIAN);
